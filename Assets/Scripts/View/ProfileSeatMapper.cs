@@ -1,13 +1,12 @@
-// ProfileSeatMapper.cs  (data-driven version)
-// 4 profile slots are FIXED at the screen corners and never move.
-// On board rotation, each slot is re-BOUND to the player whose yard is now
-// at that corner. Attach to any UI object, assign slots + player data.
-//
-// Corner layout (unrotated board):
-//   P0 Blue = Down-Left, P1 Yellow = Up-Left,
-//   P2 Red  = Up-Right,  P3 Green  = Down-Right
-// A 180° flip swaps corners diagonally: UR<->DL, UL<->DR.
+// ProfileSeatMapper.cs  (online-aware)
+// 4 fixed corner slots; each is BOUND to the player whose yard is at that
+// corner. Online additions:
+//   - SetOnlineData(names): fill slots from the match document; slots for
+//     unused seats (2-3 player matches) hide themselves.
+//   - SetCurrentPlayer(cur, localSeat): when localSeat >= 0 (online), only
+//     the LOCAL player's own button can ever be interactable.
 
+using System.Collections.Generic;
 using UnityEngine;
 
 public class ProfileSeatMapper : MonoBehaviour
@@ -35,8 +34,8 @@ public class ProfileSeatMapper : MonoBehaviour
         { Corner.DownLeft, Corner.UpLeft, Corner.UpRight, Corner.DownRight };
 
     private LudoGameManager manager;
+    private int activeCount = 4;
 
-    /// Called by LudoGameManager in Start().
     public void Init(LudoGameManager mgr)
     {
         manager = mgr;
@@ -47,7 +46,15 @@ public class ProfileSeatMapper : MonoBehaviour
 
     void OnDestroy() => BoardOrientation.OnBoardRotated -= Rebind;
 
-    /// Re-assign every slot to the player whose yard is at its corner now.
+    /// Online: fill names from the match document (index = seat).
+    public void SetOnlineData(IList<string> names)
+    {
+        activeCount = Mathf.Clamp(names.Count, 2, 4);
+        for (int i = 0; i < players.Length; i++)
+            if (i < names.Count) players[i].playerName = names[i];
+        Rebind();
+    }
+
     public void Rebind()
     {
         bool rotated = BoardOrientation.IsRotated;
@@ -56,10 +63,17 @@ public class ProfileSeatMapper : MonoBehaviour
         {
             Corner c = homeCorner[p];
             if (rotated) c = Diagonal(c);
-            GetSlot(c).Bind(p, players[p].playerName, players[p].avatar);
+            var slot = GetSlot(c);
+
+            if (p >= activeCount)
+            {
+                slot.gameObject.SetActive(false);
+                continue;
+            }
+            slot.gameObject.SetActive(true);
+            slot.Bind(p, players[p].playerName, players[p].avatar);
         }
 
-        // Restore turn state onto the (re)bound buttons.
         if (manager != null) manager.RefreshTurnState();
     }
 
@@ -68,14 +82,20 @@ public class ProfileSeatMapper : MonoBehaviour
     public PlayerProfileSlot GetSlotForPlayer(int playerIndex)
     {
         foreach (var s in AllSlots())
-            if (s.BoundPlayer == playerIndex) return s;
+            if (s.gameObject.activeSelf && s.BoundPlayer == playerIndex) return s;
         return null;
     }
 
-    public void SetCurrentPlayer(int playerIndex)
+    /// localSeat >= 0: online mode — only the local player's button may
+    /// become interactable (remote players' buttons stay off on my screen).
+    public void SetCurrentPlayer(int playerIndex, int localSeat = -1)
     {
         foreach (var s in AllSlots())
-            s.SetActiveTurn(s.BoundPlayer == playerIndex);
+        {
+            bool active = s.BoundPlayer == playerIndex
+                       && (localSeat < 0 || s.BoundPlayer == localSeat);
+            s.SetActiveTurn(active);
+        }
     }
 
     public void DisableAll()
@@ -92,10 +112,10 @@ public class ProfileSeatMapper : MonoBehaviour
     {
         switch (c)
         {
-            case Corner.DownLeft:  return Corner.UpRight;
-            case Corner.UpRight:   return Corner.DownLeft;
-            case Corner.UpLeft:    return Corner.DownRight;
-            default:               return Corner.UpLeft;   // DownRight
+            case Corner.DownLeft: return Corner.UpRight;
+            case Corner.UpRight: return Corner.DownLeft;
+            case Corner.UpLeft: return Corner.DownRight;
+            default: return Corner.UpLeft;   // DownRight
         }
     }
 
@@ -103,10 +123,10 @@ public class ProfileSeatMapper : MonoBehaviour
     {
         switch (c)
         {
-            case Corner.DownLeft:  return slotDownLeft;
-            case Corner.UpLeft:    return slotUpLeft;
-            case Corner.UpRight:   return slotUpRight;
-            default:               return slotDownRight;
+            case Corner.DownLeft: return slotDownLeft;
+            case Corner.UpLeft: return slotUpLeft;
+            case Corner.UpRight: return slotUpRight;
+            default: return slotDownRight;
         }
     }
 }

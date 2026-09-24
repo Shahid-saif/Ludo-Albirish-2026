@@ -1,12 +1,14 @@
 // LudoGameManager.cs
-// Attach to an empty GameObject named "GameManager".
+// Drives the board in two modes:
+//   Offline — LudoLocalGame runs everything on-device (unchanged behavior).
+//   Online  — the server is the truth: dice press => SubmitRoll,
+//             piece tap => SubmitMove, and ALL movement (mine and my
+//             opponents') animates via one path: diff the incoming state
+//             against the last rendered state.
 //
-// Setup checklist:
-//  - boardTrack: 52 transforms, index 0 = player 0 (Blue) start cell, travel order
-//  - players[p]: 4 yard points, 6 win points (52..57), 4 LudoTokenView
-//    (dice UI now lives in PlayerProfileSlot, not here)
-//  - profiles: the ProfileSeatMapper with the 4 fixed corner slots
-//  - Put ALL pieces under one shared parent so stack sorting works.
+// Online setup: mode = Online, assign `online` (CloudMatchService) and
+// `orientation` (BoardOrientation with applyOnStart OFF). The board
+// initializes itself when the match document turns "active".
 
 using System.Collections;
 using System.Collections.Generic;
@@ -15,6 +17,13 @@ using LudoCore;
 
 public class LudoGameManager : MonoBehaviour
 {
+    public enum GameMode { Offline, Online }
+
+    [Header("Mode")]
+    public GameMode mode = GameMode.Offline;
+    public CloudMatchService online;         // required in Online mode
+    public BoardOrientation orientation;     // used in Online mode
+
     [Header("Players")]
     [Range(2, 4)] public int playerCount = 4;
 
@@ -27,77 +36,325 @@ public class LudoGameManager : MonoBehaviour
         public Transform[] yardPoints;   // 4
         public Transform[] winPoints;    // 6 (positions 52..57)
         public LudoTokenView[] tokens;   // 4
-        public bool isBot;               // seat driven by LudoBot
+        public bool isBot;               // OFFLINE ONLY (server bots come later)
     }
-    public PlayerPoints[] players;       // size = playerCount
+    public PlayerPoints[] players;       // size 4; playerCount used at runtime
 
     [Header("Profiles")]
     public ProfileSeatMapper profiles;
 
     [Header("Animation")]
     public float stepDuration = 0.18f;
+    [Tooltip("How long a remote player's dice value shows before their move animates")]
+    public float remoteDiceShowTime = 0.6f;
 
     [Header("Stacking")]
-    [Tooltip("Pixel offset per piece when several share a cell (up & right)")]
     public Vector2 stackOffset = new Vector2(8f, 8f);
 
     [Header("Turn styling")]
-    [Tooltip("Scale multiplier for the current player's pieces")]
     public float activeScale = 1.15f;
 
     [Header("Gameplay helpers")]
-    [Tooltip("Auto-play when the player has no meaningful choice (single move, or all moves identical e.g. stacked pieces / all leaving the yard)")]
     public bool autoMoveWhenNoChoice = true;
-    [Tooltip("Delay before the auto-move so the player reads the dice first")]
     public float autoMoveDelay = 0.3f;
 
-    [Header("Bots")]
-    [Tooltip("Thinking time before a bot presses the dice")]
+    [Header("Bots (offline only)")]
     public float botRollDelay = 0.7f;
-    [Tooltip("Thinking time before a bot picks its piece")]
     public float botMoveDelay = 0.5f;
 
-    private LudoLocalGame game;
+    // ---- internals
+    private LudoLocalGame game;              // offline only
     private RollResult pendingRoll;
     private bool animating;
     private int arrivalCounter;
     private bool gameOver;
     private bool botThinking;
 
+    private bool onlineReady;
+    private LudoGameState lastRendered;      // online: what the board shows
+    private bool processingRemote;
+    private long lastActionSeq;              // last replayed action
+
+    /// The authoritative state for the current mode.
+    private LudoGameState S =>
+        mode == GameMode.Online ? online.Current?.State : game?.State;
+
+    private int MySeat => mode == GameMode.Online ? online.MySeat : -1;
+
+    // ============================================================ START
+
     void Start()
     {
-        game = new LudoLocalGame(playerCount);
+        if (mode == GameMode.Offline)
+        {
+            game = new LudoLocalGame(playerCount);
+            InitViews();
+            profiles.Init(this);
+            RefreshBoardVisuals();
+            RefreshTurnState();
+        }
+        else
+        {
+            profiles.Init(this);
+            online.OnMatchUpdated += OnMatchDoc;
+            if (online.Current != null) OnMatchDoc(online.Current);
+        }
+    }
 
+    private void InitViews()
+    {
         for (int p = 0; p < playerCount; p++)
             for (int t = 0; t < LudoConfig.TokensPerPlayer; t++)
             {
                 players[p].tokens[t].Init(this, p, t);
                 players[p].tokens[t].ArrivalOrder = ++arrivalCounter;
             }
-
-        profiles.Init(this);   // wires slot dice buttons + first Rebind
-        RefreshBoardVisuals();
-        RefreshTurnState();
     }
 
-    // ------------------------------------------------------------ UI HOOKS
+    // ================================================== ONLINE UPDATES
 
-    /// Called by PlayerProfileSlot when its dice button is pressed.
-    public void OnDiceButtonPressed(int player)
+    private void OnMatchDoc(MatchDoc doc)
     {
-        if (gameOver || animating || pendingRoll != null) return;
-        if (player != game.State.CurrentPlayer) return;
+        if (!doc.IsActive && !doc.IsFinished) return;   // still waiting
 
+        if (!onlineReady)
+        {
+            // First time the match is active: build the board for it.
+            onlineReady = true;
+            playerCount = doc.MaxPlayers;
+            InitViews();
+            profiles.SetOnlineData(doc.PlayerNames);
+            if (orientation != null)
+                orientation.SetLocalPlayer(online.MySeat);
+            lastRendered = doc.State.Clone();
+            lastActionSeq = doc.ActionSeq;
+            RefreshBoardVisuals();
+            RefreshTurnState();
+            return;
+        }
+
+        if (!processingRemote)
+            StartCoroutine(ProcessRemote());
+    }
+
+    /// Replay server actions one by one: show the actor's dice, pause so it
+    /// can be read, then animate that exact move via the local engine
+    /// (deterministic replay). Falls back to a snap-diff if the action
+    /// history has a gap (e.g. long disconnect).
+    private IEnumerator ProcessRemote()
+    {
+        processingRemote = true;
+
+        var doc = online.Current;
+        while (doc != null &&
+               (lastActionSeq < doc.ActionSeq || !StatesEqual(lastRendered, S)))
+        {
+            var pending = new List<MatchAction>();
+            foreach (var a in doc.Actions)
+                if (a.Seq > lastActionSeq) pending.Add(a);
+            pending.Sort((a, b) => a.Seq.CompareTo(b.Seq));
+
+            bool gap = pending.Count == 0 || pending[0].Seq != lastActionSeq + 1;
+
+            if (!gap)
+            {
+                var sim = lastRendered.Clone();
+                foreach (var a in pending)
+                {
+                    if (a.T == "R")
+                    {
+                        Debug.Log($"[replay] seat {a.Seat} rolled {a.Dice}");
+                        var slot = profiles.GetSlotForPlayer(a.Seat);
+                        if (slot == null)
+                            Debug.LogWarning($"[replay] no slot bound for seat {a.Seat}!");
+                        else slot.SetDiceValue(a.Dice);
+                        if (a.Seat != MySeat)
+                            yield return new WaitForSeconds(remoteDiceShowTime);
+                        try { LudoEngine.ApplyRoll(sim, a.Dice); }
+                        catch { gap = true; break; }
+                    }
+                    else
+                    {
+                        Debug.Log($"[replay] seat {a.Seat} moves token {a.Token}");
+                        MoveResult r;
+                        try { r = LudoEngine.ApplyMove(sim, a.Token); }
+                        catch { gap = true; break; }
+                        yield return AnimateSingleMove(a.Seat, r);
+                    }
+                    lastActionSeq = a.Seq;
+                }
+                if (!gap) lastRendered = sim;
+            }
+
+            if (gap)
+            {
+                Debug.LogWarning("[replay] history gap — snapping to latest state");
+                var target = S.Clone();
+                yield return AnimateDiff(lastRendered, target);
+                lastRendered = target;
+                lastActionSeq = doc.ActionSeq;
+            }
+
+            doc = online.Current;   // a newer doc may have arrived meanwhile
+        }
+
+        RefreshBoardVisuals();
+
+        if (doc != null && doc.IsFinished && !gameOver)
+        {
+            gameOver = true;
+            Debug.Log($"GAME OVER! Finish order: {string.Join(", ", S.FinishedPlayers)}");
+            profiles.DisableAll();
+            online.StopPolling();
+        }
+        else
+        {
+            RefreshTurnState();
+            RestorePendingTurn();
+        }
+
+        processingRemote = false;
+    }
+
+    /// Animate one engine-validated move (mover steps, captures fly home).
+    private IEnumerator AnimateSingleMove(int player, MoveResult r)
+    {
+        animating = true;
+        var view = players[player].tokens[r.Move.TokenIndex];
+        view.ArrivalOrder = ++arrivalCounter;
+        view.transform.SetAsLastSibling();
+
+        if (r.Move.LeavesBase)
+        {
+            yield return view.MoveTo(GetWorldPoint(player, r.Move.TokenIndex, r.Move.ToPos).position, stepDuration);
+        }
+        else
+        {
+            for (int pos = r.Move.FromPos + 1; pos <= r.Move.ToPos; pos++)
+                yield return view.MoveTo(GetWorldPoint(player, r.Move.TokenIndex, pos).position, stepDuration);
+        }
+
+        foreach (var (cp, ct) in r.Captured)
+        {
+            var capView = players[cp].tokens[ct];
+            capView.ArrivalOrder = ++arrivalCounter;
+            yield return capView.MoveTo(GetWorldPoint(cp, ct, 0).position, stepDuration * 2f);
+        }
+
+        animating = false;
+    }
+
+    private IEnumerator AnimateDiff(LudoGameState from, LudoGameState to)
+    {
+        animating = true;
+
+        // Movers first (forward changes), then captures (pieces sent home).
+        for (int p = 0; p < playerCount; p++)
+            for (int t = 0; t < LudoConfig.TokensPerPlayer; t++)
+            {
+                int o = from.GetToken(p, t), n = to.GetToken(p, t);
+                if (n <= o) continue;
+
+                var view = players[p].tokens[t];
+                view.ArrivalOrder = ++arrivalCounter;
+                view.transform.SetAsLastSibling();
+
+                if (o == 0)
+                {
+                    yield return view.MoveTo(GetWorldPoint(p, t, n).position, stepDuration);
+                }
+                else
+                {
+                    for (int pos = o + 1; pos <= n; pos++)
+                        yield return view.MoveTo(GetWorldPoint(p, t, pos).position, stepDuration);
+                }
+            }
+
+        for (int p = 0; p < playerCount; p++)
+            for (int t = 0; t < LudoConfig.TokensPerPlayer; t++)
+            {
+                int o = from.GetToken(p, t), n = to.GetToken(p, t);
+                if (!(n == 0 && o > 0)) continue;
+
+                var view = players[p].tokens[t];
+                view.ArrivalOrder = ++arrivalCounter;
+                yield return view.MoveTo(GetWorldPoint(p, t, 0).position, stepDuration * 2f);
+            }
+
+        animating = false;
+    }
+
+    /// If it's my turn and a roll is already pending on the server (resume
+    /// mid-turn after reconnect), rebuild the local choice UI.
+    private void RestorePendingTurn()
+    {
+        if (S == null || pendingRoll != null) return;
+        if (S.CurrentPlayer != MySeat || S.PendingRoll == -1) return;
+
+        pendingRoll = new RollResult
+        {
+            DiceValue = S.PendingRoll,
+            MustMove = true,
+            LegalMoves = LudoEngine.GetLegalMoves(S, MySeat, S.PendingRoll)
+        };
+        ShowChoices(MySeat);
+    }
+
+    private static bool StatesEqual(LudoGameState a, LudoGameState b)
+    {
+        if (a == null || b == null) return false;
+        if (a.TurnNumber != b.TurnNumber) return false;
+        for (int i = 0; i < a.Tokens.Length; i++)
+            if (a.Tokens[i] != b.Tokens[i]) return false;
+        return true;
+    }
+
+    // ======================================================== UI HOOKS
+
+    public async void OnDiceButtonPressed(int player)
+    {
+        if (gameOver || animating || pendingRoll != null || S == null) return;
+        if (player != S.CurrentPlayer) return;
+
+        if (mode == GameMode.Online)
+        {
+            if (player != MySeat) return;      // can only roll for myself
+
+            try
+            {
+                var resp = await online.SubmitRoll();
+                var slot = profiles.GetSlotForPlayer(player);
+                if (slot != null) slot.SetDiceValue(resp.roll);
+
+                if (!resp.mustMove) return;    // turn advanced server-side
+
+                pendingRoll = new RollResult
+                {
+                    DiceValue = resp.roll,
+                    MustMove = true,
+                    LegalMoves = resp.legalMoves
+                };
+                ShowChoices(player);
+            }
+            catch { UIManager.I.ShowError("error.network"); }
+            return;
+        }
+
+        // ---- offline
         pendingRoll = game.RollDice();
         ShowDice(player, pendingRoll.DiceValue);
 
         if (!pendingRoll.MustMove)
         {
-            pendingRoll = null;   // no legal move / 3rd six: turn already advanced
+            pendingRoll = null;
             RefreshTurnState();
             return;
         }
+        ShowChoices(player);
+    }
 
+    private void ShowChoices(int player)
+    {
         foreach (var m in pendingRoll.LegalMoves)
             players[player].tokens[m.TokenIndex].SetHighlight(true);
 
@@ -105,8 +362,6 @@ public class LudoGameManager : MonoBehaviour
             StartCoroutine(AutoMoveSingle(player, pendingRoll.LegalMoves[0].TokenIndex));
     }
 
-    /// True when every legal move has the same From->To (stacked pieces,
-    /// all-in-yard six, or literally one option): nothing to decide.
     private static bool IsChoiceMeaningless(List<LudoMove> moves)
     {
         for (int i = 1; i < moves.Count; i++)
@@ -119,15 +374,15 @@ public class LudoGameManager : MonoBehaviour
     private IEnumerator AutoMoveSingle(int player, int tokenIndex)
     {
         yield return new WaitForSeconds(autoMoveDelay);
-        // Still valid? (paranoia: state can't change here, but cheap to check)
-        if (pendingRoll != null && player == game.State.CurrentPlayer)
+        if (pendingRoll != null && S != null && player == S.CurrentPlayer)
             OnTokenClicked(player, tokenIndex);
     }
 
-    public void OnTokenClicked(int player, int tokenIndex)
+    public async void OnTokenClicked(int player, int tokenIndex)
     {
-        if (gameOver || animating || pendingRoll == null) return;
-        if (player != game.State.CurrentPlayer) return;
+        if (gameOver || animating || pendingRoll == null || S == null) return;
+        if (player != S.CurrentPlayer) return;
+        if (mode == GameMode.Online && player != MySeat) return;
 
         bool legal = false;
         foreach (var m in pendingRoll.LegalMoves)
@@ -135,14 +390,33 @@ public class LudoGameManager : MonoBehaviour
         if (!legal) return;
 
         ClearHighlights(player);
+
+        if (mode == GameMode.Online)
+        {
+            var roll = pendingRoll;
+            pendingRoll = null;
+            try
+            {
+                await online.SubmitMove(tokenIndex);
+                // Animation happens via ProcessRemote when the doc applies.
+            }
+            catch
+            {
+                pendingRoll = roll;            // restore choice on failure
+                ShowChoices(player);
+                UIManager.I.ShowError("error.network");
+            }
+            return;
+        }
+
+        // ---- offline
         var result = game.MoveToken(tokenIndex);
         pendingRoll = null;
-
         players[player].tokens[tokenIndex].ArrivalOrder = ++arrivalCounter;
         StartCoroutine(AnimateMove(player, tokenIndex, result));
     }
 
-    // ----------------------------------------------------------- ANIMATION
+    // ============================================== OFFLINE ANIMATION
 
     private IEnumerator AnimateMove(int player, int tokenIndex, MoveResult r)
     {
@@ -181,24 +455,22 @@ public class LudoGameManager : MonoBehaviour
         RefreshTurnState();
     }
 
-    // ------------------------------------------------- VISUAL REFRESH PASS
+    // ============================================= VISUAL REFRESH PASS
 
-    /// Re-seats every piece on its point, offsetting and sorting stacks.
-    /// Public: BoardOrientation calls this after rotating the board.
     public void RefreshBoardVisuals()
     {
-        var groups = new Dictionary<Transform, List<LudoTokenView>>();
+        if (S == null) return;
+        var shown = mode == GameMode.Online && lastRendered != null ? lastRendered : S;
 
+        var groups = new Dictionary<Transform, List<LudoTokenView>>();
         for (int p = 0; p < playerCount; p++)
-        {
             for (int t = 0; t < LudoConfig.TokensPerPlayer; t++)
             {
-                var point = GetWorldPoint(p, t, game.State.GetToken(p, t));
+                var point = GetWorldPoint(p, t, shown.GetToken(p, t));
                 if (!groups.TryGetValue(point, out var list))
                     groups[point] = list = new List<LudoTokenView>();
                 list.Add(players[p].tokens[t]);
             }
-        }
 
         foreach (var kv in groups)
         {
@@ -213,23 +485,21 @@ public class LudoGameManager : MonoBehaviour
         }
     }
 
-    /// Enables the right slot's dice button and styles pieces for the turn.
-    /// Public: ProfileSeatMapper re-calls this after every rebind.
     public void RefreshTurnState()
     {
-        if (game == null || gameOver) return;
-        int cur = game.State.CurrentPlayer;
+        if (S == null || gameOver) return;
+        int cur = S.CurrentPlayer;
 
-        profiles.SetCurrentPlayer(cur);
+        profiles.SetCurrentPlayer(cur, mode == GameMode.Online ? MySeat : -1);
 
         for (int p = 0; p < playerCount; p++)
             foreach (var tok in players[p].tokens)
                 tok.SetTurnState(p == cur, activeScale);
 
-        CheckBotTurn();
+        if (mode == GameMode.Offline) CheckBotTurn();
     }
 
-    // -------------------------------------------------------------- BOTS
+    // ============================================== BOTS (OFFLINE ONLY)
 
     private void CheckBotTurn()
     {
@@ -249,9 +519,6 @@ public class LudoGameManager : MonoBehaviour
 
         OnDiceButtonPressed(player);
 
-        // Roll produced a meaningful choice? Pick with the bot brain.
-        // (No-choice rolls are handled by the auto-move; rolls with no legal
-        //  move already advanced the turn.)
         if (pendingRoll != null && !IsChoiceMeaningless(pendingRoll.LegalMoves))
         {
             yield return new WaitForSeconds(botMoveDelay);
@@ -263,13 +530,11 @@ public class LudoGameManager : MonoBehaviour
         }
 
         botThinking = false;
-        // If the turn already passed to another bot (e.g. roll had no legal
-        // move), chain into it.
         if (!animating && pendingRoll == null)
             CheckBotTurn();
     }
 
-    // ------------------------------------------------------------- HELPERS
+    // ========================================================= HELPERS
 
     public Transform GetWorldPoint(int player, int tokenIndex, int enginePos)
     {

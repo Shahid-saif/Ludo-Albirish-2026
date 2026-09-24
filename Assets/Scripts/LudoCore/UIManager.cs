@@ -108,6 +108,10 @@ public class UIManager : MonoBehaviour
     /// Shorthand: error with OK, or Retry/Cancel when onRetry is provided.
     public void ShowError(string messageKey, Action onRetry = null)
     {
+        // Diagnostic: identify who requested this popup.
+        Debug.LogWarning($"[UIManager] ShowError('{messageKey}') requested by:\n"
+                         + new System.Diagnostics.StackTrace(1, true));
+
         ShowPopup(new PopupData
         {
             TitleKey   = "popup.error.title",

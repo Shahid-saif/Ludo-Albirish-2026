@@ -53,6 +53,8 @@ public static class Loc
         ["btn.cancel"]          = "Cancel",
         ["btn.yes"]             = "Yes",
         ["btn.no"]              = "No",
+
+        ["lobby.copied"]        = "Copied!",
     };
 
     private static readonly Dictionary<string, string> AR = new()
@@ -71,5 +73,7 @@ public static class Loc
         ["btn.cancel"]          = "إلغاء",
         ["btn.yes"]             = "نعم",
         ["btn.no"]              = "لا",
+
+        ["lobby.copied"]        = "تم النسخ!",
     };
 }
